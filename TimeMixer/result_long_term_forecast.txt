@@ -1,0 +1,15 @@
+long_term_forecast_HopMixer_none_HopMixer_ETTh1_sl96_pl96_dm16_nh4_el2_dl1_df32_fc3_ebtimeF_dtTrue_test_0  
+mse:0.3769340217113495, mae:0.3918794095516205
+
+long_term_forecast_HopMixer_none_HopMixer_ETTh1_sl96_pl96_dm16_nh4_el2_dl1_df32_fc3_ebtimeF_dtTrue_test_0  
+mse:0.37803900241851807, mae:0.3903670907020569
+
+long_term_forecast_HopMixer_none_HopMixer_ETTh1_sl96_pl96_dm16_nh4_el2_dl1_df32_fc3_ebtimeF_dtTrue_test_0  
+mse:0.36624875664711, mae:0.39088284969329834
+
+long_term_forecast_HopMixer_none_HopMixer_ETTh1_sl96_pl96_dm16_nh4_el2_dl1_df32_fc3_ebtimeF_dtTrue_test_0  
+mse:0.36624875664711, mae:0.39088281989097595
+
+long_term_forecast_HopMixer_none_HopMixer_ETTh1_sl96_pl96_dm16_nh4_el2_dl1_df32_fc3_ebtimeF_dtTrue_test_0  
+mse:0.3709064722061157, mae:0.3873174786567688
+
