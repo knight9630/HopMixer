@@ -33,11 +33,13 @@ parser.add_argument('--freq', type=str, default='h',
 parser.add_argument('--checkpoints', type=str, default='./checkpoints/', help='location of model checkpoints')
 
 # forecasting task
-parser.add_argument('--seq_len', type=int, default=192, help='input sequence length')
+parser.add_argument('--seq_len', type=int, default=96, help='input sequence length')
 parser.add_argument('--label_len', type=int, default=0, help='start token length')
 parser.add_argument('--pred_len', type=int, default=720, help='prediction sequence length')
 parser.add_argument('--seasonal_patterns', type=str, default='Monthly', help='subset for M4')
 parser.add_argument('--inverse', action='store_true', help='inverse output data', default=False)
+parser.add_argument('--global_patch', type=int, default=256, help='global patch length')
+parser.add_argument('--local_patch', type=int, default=32, help='local patch length')
 
 # model define
 parser.add_argument('--top_k', type=int, default=5, help='for TimesBlock')
@@ -49,6 +51,7 @@ parser.add_argument('--d_model', type=int, default=16, help='dimension of model'
 parser.add_argument('--t_model', type=int, default=512, help='dimension of seq_len_time model')
 parser.add_argument('--time_d', type=int, default=0, help='dimension of time')
 parser.add_argument('--n_heads', type=int, default=4, help='num of heads')
+
 parser.add_argument('--e_layers', type=int, default=3, help='num of encoder layers')
 parser.add_argument('--d_layers', type=int, default=1, help='num of decoder layers')
 parser.add_argument('--d_ff', type=int, default=32, help='dimension of fcn')
@@ -78,7 +81,7 @@ parser.add_argument('--use_future_temporal_feature', type=int, default=0,
 parser.add_argument('--num_workers', type=int, default=10, help='data loader num workers')
 parser.add_argument('--itr', type=int, default=1, help='experiments times')
 parser.add_argument('--train_epochs', type=int, default=10, help='train epochs')
-parser.add_argument('--batch_size', type=int, default=32, help='batch size of train input data')#128
+parser.add_argument('--batch_size', type=int, default=128, help='batch size of train input data')#128
 parser.add_argument('--patience', type=int, default=3, help='early stopping patience')#trafic=10
 parser.add_argument('--learning_rate', type=float, default=0.001, help='optimizer learning rate')
 parser.add_argument('--des', type=str, default='test', help='exp description')

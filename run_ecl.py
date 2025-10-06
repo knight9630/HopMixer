@@ -35,9 +35,11 @@ parser.add_argument('--checkpoints', type=str, default='./checkpoints/', help='l
 # forecasting task
 parser.add_argument('--seq_len', type=int, default=96, help='input sequence length')
 parser.add_argument('--label_len', type=int, default=0, help='start token length')
-parser.add_argument('--pred_len', type=int, default=96, help='prediction sequence length')
+parser.add_argument('--pred_len', type=int, default=720, help='prediction sequence length')
 parser.add_argument('--seasonal_patterns', type=str, default='Monthly', help='subset for M4')
 parser.add_argument('--inverse', action='store_true', help='inverse output data', default=False)
+parser.add_argument('--global_patch', type=int, default=128, help='global patch length')
+parser.add_argument('--local_patch', type=int, default=32, help='local patch length')
 
 # model define
 parser.add_argument('--top_k', type=int, default=5, help='for TimesBlock')
@@ -78,7 +80,7 @@ parser.add_argument('--use_future_temporal_feature', type=int, default=0,
 parser.add_argument('--num_workers', type=int, default=10, help='data loader num workers')
 parser.add_argument('--itr', type=int, default=1, help='experiments times')
 parser.add_argument('--train_epochs', type=int, default=20, help='train epochs')
-parser.add_argument('--batch_size', type=int, default=64, help='batch size of train input data')#128
+parser.add_argument('--batch_size', type=int, default=32, help='batch size of train input data')#128
 parser.add_argument('--patience', type=int, default=10, help='early stopping patience')#trafic=10
 parser.add_argument('--learning_rate', type=float, default=0.001, help='optimizer learning rate')
 parser.add_argument('--des', type=str, default='test', help='exp description')
@@ -106,7 +108,7 @@ if args.use_gpu and args.use_multi_gpu:
     args.devices = args.devices.replace(' ', '')
     device_ids = args.devices.split(',')
     #args.device_ids = [int(id_) for id_ in device_ids]
-    args.device_ids = [int(device_ids[i]) for i in range(0,1)]
+    args.device_ids = [int(device_ids[i]) for i in range(2,3)]
     args.gpu = args.device_ids[0]
 
 print('Args in experiment:')
