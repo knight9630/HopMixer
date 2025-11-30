@@ -20,13 +20,13 @@ parser = argparse.ArgumentParser(description='TimeMixer')
 parser.add_argument('--task_name', type=str, default='long_term_forecast',
                     help='task name, options:[long_term_forecast, short_term_forecast, imputation, classification, anomaly_detection]')
 parser.add_argument('--is_training', type=int, default=1, help='status')
-parser.add_argument('--model_id', type=str, default='HopMixer', help='model id')
-parser.add_argument('--model', type=str, default='HopMixer',
+parser.add_argument('--model_id', type=str, default='TimeMixer', help='model id')
+parser.add_argument('--model', type=str, default='TimeMixer',
                     help='model name, options: [TimeMixer,HopMixer]')
 
 # data loader
 parser.add_argument('--data', type=str, default='ETTh1', help='dataset type')
-parser.add_argument('--root_path', type=str, default='./data/ETT/', help='root path of the data file')
+parser.add_argument('--root_path', type=str, default='../data/ETT/', help='root path of the data file')
 parser.add_argument('--data_path', type=str, default='ETTh1.csv', help='data file')
 parser.add_argument('--features', type=str, default='M',
                     help='forecasting task, options:[M, S, MS]; M:multivariate predict multivariate, S:univariate predict univariate, MS:multivariate predict univariate')
@@ -38,10 +38,10 @@ parser.add_argument('--checkpoints', type=str, default='./checkpoints/', help='l
 # forecasting task
 parser.add_argument('--seq_len', type=int, default=96, help='input sequence length')
 parser.add_argument('--label_len', type=int, default=0, help='start token length')
-parser.add_argument('--pred_len', type=int, default=192, help='prediction sequence length')
+parser.add_argument('--pred_len', type=int, default=96, help='prediction sequence length')
 parser.add_argument('--seasonal_patterns', type=str, default='Monthly', help='subset for M4')
 parser.add_argument('--inverse', action='store_true', help='inverse output data', default=False)
-parser.add_argument('--global_patch', type=int, default=24, help='global patch length')
+parser.add_argument('--global_patch', type=int, default=48, help='global patch length')
 parser.add_argument('--local_patch', type=int, default=12, help='local patch length')
 
 # model define
@@ -111,7 +111,7 @@ if args.use_gpu and args.use_multi_gpu:
     args.devices = args.devices.replace(' ', '')
     device_ids = args.devices.split(',')
     #args.device_ids = [int(id_) for id_ in device_ids]
-    args.device_ids = [int(device_ids[i]) for i in range(0,1)]
+    args.device_ids = [int(device_ids[i]) for i in range(1,2)]
     args.gpu = args.device_ids[0]
 
 print('Args in experiment:')

@@ -23,7 +23,7 @@ parser.add_argument('--model', type=str, default='HopMixer',
 
 # data loader
 parser.add_argument('--data', type=str, default='custom', help='dataset type')
-parser.add_argument('--root_path', type=str, default='./data/electricity/', help='root path of the data file')
+parser.add_argument('--root_path', type=str, default='../data/electricity/', help='root path of the data file')
 parser.add_argument('--data_path', type=str, default='electricity.csv', help='data file')
 parser.add_argument('--features', type=str, default='M',
                     help='forecasting task, options:[M, S, MS]; M:multivariate predict multivariate, S:univariate predict univariate, MS:multivariate predict univariate')

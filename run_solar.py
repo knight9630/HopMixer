@@ -23,7 +23,7 @@ parser.add_argument('--model', type=str, default='HopMixer',
 
 # data loader
 parser.add_argument('--data', type=str, default='Solar', help='dataset type')
-parser.add_argument('--root_path', type=str, default='./data/solar/', help='root path of the data file')
+parser.add_argument('--root_path', type=str, default='../data/solar/', help='root path of the data file')
 parser.add_argument('--data_path', type=str, default='solar_AL.txt', help='data file')
 parser.add_argument('--features', type=str, default='M',
                     help='forecasting task, options:[M, S, MS]; M:multivariate predict multivariate, S:univariate predict univariate, MS:multivariate predict univariate')
@@ -35,11 +35,11 @@ parser.add_argument('--checkpoints', type=str, default='./checkpoints/', help='l
 # forecasting task
 parser.add_argument('--seq_len', type=int, default=96, help='input sequence length')
 parser.add_argument('--label_len', type=int, default=0, help='start token length')
-parser.add_argument('--pred_len', type=int, default=720, help='prediction sequence length')
+parser.add_argument('--pred_len', type=int, default=192, help='prediction sequence length')
 parser.add_argument('--seasonal_patterns', type=str, default='Monthly', help='subset for M4')
 parser.add_argument('--inverse', action='store_true', help='inverse output data', default=False)
 parser.add_argument('--global_patch', type=int, default=256, help='global patch length')
-parser.add_argument('--local_patch', type=int, default=32, help='local patch length')
+parser.add_argument('--local_patch', type=int, default=16, help='local patch length')
 
 # model define
 parser.add_argument('--top_k', type=int, default=5, help='for TimesBlock')
@@ -109,7 +109,7 @@ if args.use_gpu and args.use_multi_gpu:
     args.devices = args.devices.replace(' ', '')
     device_ids = args.devices.split(',')
     #args.device_ids = [int(id_) for id_ in device_ids]
-    args.device_ids = [int(device_ids[i]) for i in range(1,2)]
+    args.device_ids = [int(device_ids[i]) for i in range(2,4)]
     args.gpu = args.device_ids[0]
 
 print('Args in experiment:')
