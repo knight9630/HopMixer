@@ -159,7 +159,23 @@ class PastDecomposableMixing(nn.Module):
             out_list.append(out[:, :length, :])
         return out_list
 
+class PatchMLP(nn.Module):
+    def __init__(self, dim, hidden=None, dropout=0.0):
+        super(PatchMLP, self).__init__()
+        if hidden is None:
+            hidden = max(16, dim // 2)
+        self.net = nn.Sequential(
+            nn.Linear(dim, hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, dim),
+        )
+        self.norm = nn.LayerNorm(dim)
 
+    def forward(self, x):
+        # x: [L]
+        return self.norm(x + self.net(x))
+    
 class Model(nn.Module):
 
     def __init__(self, configs):
@@ -169,6 +185,7 @@ class Model(nn.Module):
         self.seq_len = configs.seq_len
         self.label_len = configs.label_len
         self.pred_len = configs.pred_len
+        self.channel = configs.enc_in
         self.down_sampling_window = configs.down_sampling_window
         self.channel_independence = configs.channel_independence
         self.pdm_blocks = nn.ModuleList([PastDecomposableMixing(configs)
@@ -177,6 +194,16 @@ class Model(nn.Module):
         self.preprocess = series_decomp(configs.moving_avg)
         self.enc_in = configs.enc_in
         self.global_patch = configs.global_patch
+
+        self.P_per_channel = configs.seq_len // configs.global_patch
+        self.patch_count = configs.enc_in * self.P_per_channel  # configs.enc_in * (seq_len//global_patch)
+         # 为每个目标 patch m 初始化 self.patch_count 个线性层：self.patch_linears[m][j]
+        # 结构为 ModuleList[ M ]，每项为 ModuleList[ M ] 的 nn.Linear(L->L)
+        self.patch_linears = nn.ModuleList(
+            [nn.ModuleList([PatchMLP(self.global_patch, hidden=self.global_patch//2, dropout=0.1)
+                            for _ in range(self.patch_count)])
+             for _ in range(self.patch_count)]
+        )
 
         if self.channel_independence:
             self.enc_embedding = DataEmbedding_wo_pos(1, configs.d_model, configs.embed, configs.freq,
@@ -388,9 +415,58 @@ class Model(nn.Module):
                 raise ValueError(f"unknown grouping method: {method}")
 
         return groups_all
-# ...existing code...
     
-    def compute_group_reference_and_offsets(self, patches, groups_all, max_shift, ref_method='mean', eps=1e-8):
+    def interp_fill(self, patch, lag):
+        # patch: torch.Tensor (L,)
+        arr = patch.detach().cpu().numpy().astype(np.float64)
+        Lloc = arr.shape[0]
+        filled = np.full(Lloc, np.nan, dtype=np.float64)
+        if lag > 0:
+            filled[lag:] = arr[:Lloc - lag]
+        elif lag < 0:
+            s = -lag
+            filled[:Lloc - s] = arr[s:]
+        else:
+            return patch
+        known = np.where(~np.isnan(filled))[0]
+        if known.size == 0:
+            # 全为空，退回原 patch
+            return patch
+        missing = np.where(np.isnan(filled))[0]
+        # np.interp 要求 known 有序且至少一个点：对缺失位做线性插值/外插
+        filled[missing] = np.interp(missing, known, filled[known])
+        return torch.tensor(filled.astype(np.float32), device=patch.device, dtype=patch.dtype)
+    
+    # 端点线性外推（用邻近两个点的斜率）
+    def extrap_fill(self, patch, lag):
+        Lloc = patch.size(0)
+        if lag == 0:
+            return patch
+        if lag > 0:
+            body = patch[:Lloc - lag]
+            if body.size(0) >= 2:
+                slope = (body[1] - body[0]).item()
+            elif body.size(0) == 1:
+                slope = 0.0
+            else:
+                slope = 0.0
+            left_vals = torch.tensor([body[0].item() - slope * (i + 1) for i in reversed(range(lag))],
+                                        device=patch.device, dtype=patch.dtype)
+            return torch.cat([left_vals, body])
+        else:  # lag < 0
+            s = -lag
+            body = patch[s:]
+            if body.size(0) >= 2:
+                slope = (body[-1] - body[-2]).item()
+            elif body.size(0) == 1:
+                slope = 0.0
+            else:
+                slope = 0.0
+            right_vals = torch.tensor([body[-1].item() + slope * (i + 1) for i in range(s)],
+                                        device=patch.device, dtype=patch.dtype)
+            return torch.cat([body, right_vals])
+
+    def compute_group_reference_and_offsets(self, patches, groups_all, max_shift, ref_method='mean', fill_method = 'interp',eps=1e-8):
         """
         patches: Tensor [B, C, P, L]
         groups_all: list len B, 每项是 list of groups (group: list of patch indices in 0..M-1)
@@ -438,7 +514,7 @@ class Model(nn.Module):
                     medoid_idx = torch.argmax(sumcorr)
                     ref = Xm[medoid_idx]
                 refs_b.append(ref)
-
+            
             # 对每个 patch 搜索最佳偏移
             for m in range(M):
                 gi = int(idx2grp[m].item())
@@ -480,19 +556,114 @@ class Model(nn.Module):
                 offsets[b, m] = int(best_lag)
                 patch = Xb[m]
                 lag = int(offsets[b, m].item())
-                if lag > 0:
-                    aligned_vec = torch.cat([torch.zeros(lag, device=device, dtype=patch.dtype), patch[:L - lag]])
-                elif lag < 0:
-                    s = -lag
-                    aligned_vec = torch.cat([patch[s:], torch.zeros(s, device=device, dtype=patch.dtype)])
-                else:
-                    aligned_vec = patch
-                aligned[b, m] = aligned_vec
 
+                # 选择填充策略：'reference' 表示用组 reference 的对应片段（前面已有 refs_b）
+                channel_idx = m // P
+                if gi >= 0:
+                    ref_vec = refs_b[gi]  # [L] torch tensor
+                else:
+                    ref_vec = None
+                    ch_mean_val = float(Xb.view(C, P, L).mean(dim=2).mean(dim=1)[channel_idx].item())
+
+                if fill_method == 'reference':
+                    # 用组 reference 对齐片段填充
+                    if lag > 0:
+                        if ref_vec is not None:
+                            fill = ref_vec[:lag]
+                        else:
+                            fill = torch.full((lag,), ch_mean_val, device=device, dtype=patch.dtype)
+                        aligned_vec = torch.cat([fill, patch[:L - lag]])
+                    elif lag < 0:
+                        s = -lag
+                        if ref_vec is not None:
+                            fill = ref_vec[L - s:]
+                        else:
+                            fill = torch.full((s,), ch_mean_val, device=device, dtype=patch.dtype)
+                        aligned_vec = torch.cat([patch[s:], fill])
+                    else:
+                        aligned_vec = patch
+
+                elif fill_method == 'interp':
+                    aligned_vec = self.interp_fill(patch, lag)
+
+                elif fill_method == 'extrap':
+                    aligned_vec = self.extrap_fill(patch, lag)
+
+                else:
+                    # 默认退回到 reference 填充
+                    if lag > 0:
+                        if ref_vec is not None:
+                            fill = ref_vec[:lag]
+                        else:
+                            fill = torch.full((lag,), ch_mean_val, device=device, dtype=patch.dtype)
+                        aligned_vec = torch.cat([fill, patch[:L - lag]])
+                    elif lag < 0:
+                        s = -lag
+                        if ref_vec is not None:
+                            fill = ref_vec[L - s:]
+                        else:
+                            fill = torch.full((s,), ch_mean_val, device=device, dtype=patch.dtype)
+                        aligned_vec = torch.cat([patch[s:], fill])
+                    else:
+                        aligned_vec = patch
+
+                aligned[b, m] = aligned_vec
+            
             refs_all.append(refs_b)
 
         return refs_all, offsets, aligned
     
+    def group_aggregate(self, aligned, groups_all):
+        """
+        aligned: Tensor [B, M, L]
+        groups_all: list length B, each item is list of groups (group: list of ints in 0..M-1)
+        对于每个 patch m：
+          out[b,m] = aligned[b,m] + sum_{j in same_group, j!=m} patch_linears[j]( aligned[b,j] )
+        """
+        B, M, L = aligned.shape
+        device = aligned.device
+        out = torch.zeros_like(aligned)
+
+        # 确认已按 configs 初始化好 self.patch_linears，数量应等于 M
+        if self.patch_linears is None or len(self.patch_linears) != M:
+            raise RuntimeError(f"patch_linears size ({None if self.patch_linears is None else len(self.patch_linears)}) != current M ({M}). "
+                               "请在 __init__ 中按 configs 初始化 patch_linears 为长度 enc_in*(seq_len//global_patch)。")
+
+        for b in range(B):
+            groups = groups_all[b]
+            # idx -> group 映射
+            idx2grp = [-1] * M
+            for gi, grp in enumerate(groups):
+                for idx in grp:
+                    idx2grp[int(idx)] = gi
+
+            for m in range(M):
+                self_vec = aligned[b, m]           # [L]
+                gi = idx2grp[m]
+                if gi == -1:
+                    out[b, m] = self_vec
+                    continue
+
+                grp = groups[gi]  # Python list of ints
+                # 对组内除自身外的每个 patch 用其各自的线性层变换并求和
+                sum_trans = None
+                for j in grp:
+                    j = int(j)
+                    if j == m:
+                        continue
+                    other_vec = aligned[b, j]   # [L]
+                    trans = self.patch_linears[m][j](other_vec)  # [L]
+                    if sum_trans is None:
+                        sum_trans = trans
+                    else:
+                        sum_trans = sum_trans + trans
+                if sum_trans is None:
+                    out[b, m] = self_vec
+                else:
+                    out[b, m] = self_vec + sum_trans
+
+        return out
+
     def lag_move(self, x):
         ori_x = x
         # print('x shape before lag move:', x.size())
@@ -519,13 +690,16 @@ class Model(nn.Module):
         # print('corr shape:', corr.size())
         patch_groups = self.group_patches(corr, method='threshold', threshold=0.6, min_size=1)
         
-        # 基准向量，偏移量，和对齐后的 patch（补0）
-        refs_all, offsets, aligned = self.compute_group_reference_and_offsets(patches, patch_groups, max_shift=2, ref_method='medoid')
+        # 基准向量，偏移量，和对齐后的 patch
+        refs_all, offsets, aligned = self.compute_group_reference_and_offsets(patches, patch_groups, max_shift = 2, ref_method='medoid', fill_method='interp')
+
+        processed_aligned = self.group_aggregate(aligned, patch_groups)
+
         self.patch_offsets = offsets  # [B, M]
-        self.aligned_patches = aligned.reshape(B, C, P, L).reshape(B,C,P*L)
+        self.aligned_patches = processed_aligned.reshape(B, C, P, L).reshape(B,C,P*L)
         # print('aligned patches shape:', self.aligned_patches.size())
 
-        lag_x=ori_x + self.aligned_patches.permute(0,2,1).contiguous()
+        lag_x = self.aligned_patches.permute(0,2,1).contiguous()
         return lag_x
         
 
