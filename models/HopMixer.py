@@ -4,26 +4,141 @@ from layers.Autoformer_EncDec import series_decomp
 from layers.SelfAttention_Family import GapAttention, PatchAttention
 from layers.Embed import DataEmbedding_wo_pos,DataEmbedding_inverted
 from layers.StandardNorm import Normalize
+from layers.Plugs import SeasonRectifiedAugmenter_CI, SeasonRectifiedAugmenter_CD, SeasonRectifiedAugmenter_CI_TopK, SeasonRectifiedAugmenter_CD_TopK
+import matplotlib.pyplot as plt
+import os
+import numpy as np
+
+# class DFT_series_decomp(nn.Module):
+#     """
+#     Series decomposition block
+#     """
+
+#     def __init__(self, top_k):
+#         super(DFT_series_decomp, self).__init__()
+#         self.top_k = top_k
+
+#     def forward(self, x):
+#         print("x shape:", x.shape)
+#         x=x.permute(0,2,1)  # (B, C, L)
+#         xf = torch.fft.rfft(x)
+#         freq = abs(xf)
+#         freq[0] = 0
+#         top_k_freq, top_list = torch.topk(freq, self.top_k)
+#         xf[freq <= top_k_freq.min()] = 0
+#         x_season = torch.fft.irfft(xf)
+#         x_trend = x - x_season
+#         print(f"x: {x[0][0]}")
+#         print(f"x_season: {x_season[0][0]}")
+#         print(f"x_trend: {x_trend[0][0]}")
+#         return x_season, x_trend
 
 class DFT_series_decomp(nn.Module):
     """
-    Series decomposition block
+    Series decomposition block using DFT (修复版)
+    将序列分解为季节性成分(高频)和趋势成分(低频)
     """
 
-    def __init__(self, top_k=5):
+    def __init__(self, top_k):
         super(DFT_series_decomp, self).__init__()
         self.top_k = top_k
 
     def forward(self, x):
-        xf = torch.fft.rfft(x)
-        freq = abs(xf)
-        freq[0] = 0
-        top_k_freq, top_list = torch.topk(freq, 5)
-        xf[freq <= top_k_freq.min()] = 0
-        x_season = torch.fft.irfft(xf)
+        # x: 输入形状 (B, L, C) -> 调整为 (B, C, L) 便于处理
+        x = x.permute(0, 2, 1)  # (B, C, L)
+        B, C, L = x.shape
+        
+        # 1. 进行实数快速傅里叶变换
+        xf = torch.fft.rfft(x)  # (B, C, L//2+1) 复数结果
+        freq_amp = torch.abs(xf)  # 频率幅值 (B, C, L//2+1)
+        
+        # 2. 去除直流分量 (0频率)
+        freq_amp = freq_amp.clone()
+        freq_amp[..., 0] = 0  # 使用...适配任意维度
+        
+        # 3. 找到幅值最大的top-k个频率索引
+        # top_k_values: (B, C, top_k), top_k_indices: (B, C, top_k)
+        top_k_values, top_k_indices = torch.topk(freq_amp, self.top_k, dim=-1)
+        
+        # 4. 初始化全零的频域张量，只保留top-k个频率分量
+        xf_season = torch.zeros_like(xf)
+        # 使用scatter_将top-k的频率分量回填
+        # 为每个样本-通道维度扩展索引
+        batch_idx = torch.arange(B).unsqueeze(1).unsqueeze(2).expand(-1, C, self.top_k)
+        chan_idx = torch.arange(C).unsqueeze(0).unsqueeze(2).expand(B, -1, self.top_k)
+        
+        # 只保留top-k个频率分量
+        xf_season[batch_idx, chan_idx, top_k_indices] = xf[batch_idx, chan_idx, top_k_indices]
+        
+        # 5. 逆傅里叶变换回到时域
+        x_season = torch.fft.irfft(xf_season, n=L)  # n=L确保输出长度和输入一致
         x_trend = x - x_season
+
+        # 还原原始维度 (B, C, L) -> (B, L, C)
+        x_season = x_season.permute(0, 2, 1)
+        x_trend = x_trend.permute(0, 2, 1)
+        
         return x_season, x_trend
 
+class ThreePartDFTDecomp(nn.Module):
+    """
+    基于DFT的三部分解：Season + Trend + Noise
+    """
+    def __init__(self, top_k_season, top_k_trend):
+        super(ThreePartDFTDecomp, self).__init__()
+        self.top_k_season = top_k_season # 例如 5
+        self.top_k_trend = top_k_trend   # 例如 5 (保留最低的5个频率)
+
+    def forward(self, x):
+        # x: (B, L, C) -> (B, C, L)
+        x_in = x.permute(0, 2, 1)
+        B, C, L = x_in.shape
+        
+        # 1. FFT 变换
+        xf = torch.fft.rfft(x_in) # (B, C, L//2+1)
+        freq_amp = torch.abs(xf)
+        
+        # --- 提取 Season (振幅最大的 Top-k, 排除直流分量) ---
+        # 暂时把直流分量(index 0)屏蔽掉，不让Season选它
+        freq_amp_no_dc = freq_amp.clone()
+        freq_amp_no_dc[..., 0] = 0 
+        
+        # 选出振幅最大的 k1 个频率
+        _, season_indices = torch.topk(freq_amp_no_dc, self.top_k_season, dim=-1)
+        
+        # 构建 Season 频域信号
+        xf_season = torch.zeros_like(xf)
+        batch_idx = torch.arange(B).unsqueeze(1).unsqueeze(2).expand(-1, C, self.top_k_season)
+        chan_idx = torch.arange(C).unsqueeze(0).unsqueeze(2).expand(B, -1, self.top_k_season)
+        xf_season[batch_idx, chan_idx, season_indices] = xf[batch_idx, chan_idx, season_indices]
+        
+        # Season 变回时域
+        x_season = torch.fft.irfft(xf_season, n=L)
+        
+        # --- 提取 Trend (剩下的信号中，频率最低的 Top-k) ---
+        # 剩余信号的频谱 = 原始 - Season
+        xf_residue = xf - xf_season
+        
+        # 强制选取最低频的 k2 个分量 (0, 1, 2 ... k2-1)
+        # 注意：这里我们直接切片取前 k2 个，因为 rfft 的结果是按频率从低到高排列的
+        # index 0 是直流分量(均值)，index 1 是最低频...
+        trend_indices = torch.arange(self.top_k_trend, device=x.device)
+        
+        xf_trend = torch.zeros_like(xf)
+        # 对于所有 Batch 和 Channel，都取前 k2 个频率
+        xf_trend[..., :self.top_k_trend] = xf_residue[..., :self.top_k_trend]
+        
+        # Trend 变回时域
+        x_trend = torch.fft.irfft(xf_trend, n=L)
+        
+        # --- 提取 Noise ---
+        # 原始 - Season - Trend
+        # 这里的 x_trend 和 x_season 还在 (B, C, L) 维度
+        x_noise = x_in - x_season - x_trend
+        
+        # 还原维度 (B, L, C)
+        return x_season.permute(0, 2, 1), x_trend.permute(0, 2, 1), x_noise.permute(0, 2, 1)
+    
 class MultiScaleSeasonMixing(nn.Module):
     """
     Bottom-up mixing season pattern
@@ -129,14 +244,44 @@ class PastDecomposableMixing(nn.Module):
         self.layer_norm = nn.LayerNorm(configs.d_model)
         self.dropout = nn.Dropout(configs.dropout)
         self.channel_independence = configs.channel_independence
+        self.batch_num = 0
 
         if configs.decomp_method == 'moving_avg':
             self.decompsition = series_decomp(configs.moving_avg)
         elif configs.decomp_method == "dft_decomp":
             self.decompsition = DFT_series_decomp(configs.top_k)
+        elif configs.decomp_method == "three_part_dft_decomp":
+            self.decompsition = ThreePartDFTDecomp(configs.top_k_season, configs.top_k_trend)
         else:
             raise ValueError('decompsition is error')
-        
+
+        self.alpha = nn.ParameterList([nn.Parameter(torch.zeros(1)) for _ in range(configs.down_sampling_layers + 1)])
+
+        self.gating_layers = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(configs.d_model * 3, configs.d_model), # 假设维度是 d_model
+                nn.Tanh(),
+                nn.Linear(configs.d_model, 3), # 输出三个系数
+                nn.Softmax(dim=-1) # 归一化，让三者之和为 1 (或者用 Sigmoid)
+            )
+            for _ in range(configs.down_sampling_layers + 1)
+        ])
+            
+        if configs.channel_independence==1:
+            self.rectified_layer = torch.nn.ModuleList(
+                [
+                    SeasonRectifiedAugmenter_CI_TopK(configs.agg_patch, configs.agg_patch, configs.agg_top_k)
+                    for _ in range(configs.down_sampling_layers + 1)
+                ]
+            )
+        else:
+            self.rectified_layer = torch.nn.ModuleList(
+                [
+                    SeasonRectifiedAugmenter_CD_TopK(configs.agg_patch, configs.agg_patch, configs.agg_top_k)
+                    for _ in range(configs.down_sampling_layers + 1)
+                ]
+            )
+            
         if configs.channel_independence==1:
             self.out_cross_layer = nn.Sequential(
                 nn.Linear(in_features=configs.d_model, out_features=configs.d_ff),
@@ -151,7 +296,7 @@ class PastDecomposableMixing(nn.Module):
             )
 
         if configs.channel_independence==1:
-            self.Season_FC = torch.nn.ModuleList(
+            self.Season_MLP = torch.nn.ModuleList(
                 [
                     nn.Sequential(
                         nn.Linear(in_features=configs.d_model, out_features=configs.d_ff),
@@ -162,7 +307,7 @@ class PastDecomposableMixing(nn.Module):
                 ]
             )
         else:
-            self.Season_FC = torch.nn.ModuleList(
+            self.Season_MLP = torch.nn.ModuleList(
                 [
                     nn.Sequential(
                         nn.Linear(in_features=configs.enc_in+configs.time_d, out_features=2*(configs.enc_in+configs.time_d)),
@@ -173,6 +318,29 @@ class PastDecomposableMixing(nn.Module):
                 ]
             )
         
+        if configs.channel_independence==1:
+            self.Trend_MLP = torch.nn.ModuleList(
+                [
+                    nn.Sequential(
+                        nn.Linear(in_features=configs.d_model, out_features=configs.d_ff),
+                        nn.GELU(),
+                        nn.Linear(in_features=configs.d_ff, out_features=configs.d_model),
+                    )
+                    for i in range(configs.down_sampling_layers + 1)
+                ]
+            )
+        else:
+            self.Trend_MLP = torch.nn.ModuleList(
+                [
+                    nn.Sequential(
+                        nn.Linear(in_features=configs.enc_in+configs.time_d, out_features=2*(configs.enc_in+configs.time_d)),
+                        nn.GELU(),
+                        nn.Linear(in_features=2*(configs.enc_in+configs.time_d), out_features=configs.enc_in+configs.time_d),
+                    )
+                    for i in range(configs.down_sampling_layers + 1)
+                ]
+            )
+            
         if configs.channel_independence==1:
             self.multigapattention1 = torch.nn.ModuleList(
                 [
@@ -206,21 +374,70 @@ class PastDecomposableMixing(nn.Module):
                 ]
             )
 
-        # if configs.channel_independence==1:
-        #     self.patchattention = torch.nn.ModuleList(
-        #         [
-        #             PatchAttention(configs.seq_len,24)
-        #             for i in range(configs.down_sampling_layers + 1)
-        #         ]
-        #     )
-        # else:
-        #     self.patchattention = torch.nn.ModuleList(
-        #         [
-        #             PatchAttention(configs.t_model,128)
-        #             for i in range(configs.down_sampling_layers + 1)
-        #         ]
-        #     )
-    
+
+    def plot_first_sample_curves(self, x, trend, season, layer_idx, save_dir="batch_plots"):
+            """
+            类内方法：仅绘制第一个样本（batch_idx=0）的所有N序列，保存到指定目录
+            适配GPU/CPU张量，自动转换为NumPy数组
+            """
+            # 核心修复：将GPU张量转移到CPU并转为NumPy数组
+            def tensor_to_numpy(tensor):
+                # 如果是张量，先转CPU再转NumPy；如果已经是NumPy则直接返回
+                if isinstance(tensor, torch.Tensor):
+                    return tensor.detach().cpu().numpy()  # detach()避免梯度关联，cpu()转CPU，numpy()转数组
+                return np.array(tensor)
+            
+            # 转换所有输入数据为NumPy数组（兼容GPU/CPU张量）
+            x_np = tensor_to_numpy(x)
+            trend_np = tensor_to_numpy(trend)
+            season_np = tensor_to_numpy(season)
+            # print(f"x: {x_np[0][0]}")
+            # print(f"season: {season_np[0][0]}")
+            # print(f"trend: {trend_np[0][0]}")
+            
+            # 1. 创建保存目录
+            os.makedirs(save_dir, exist_ok=True)
+            
+            # 2. 提取第一个样本的数据（固定batch_idx=0）
+            batch_idx = 13
+            x_first = x_np[batch_idx]    # shape=(N, len)
+            trend_first = trend_np[batch_idx]
+            season_first = season_np[batch_idx]
+            N_count = x_first.shape[0]
+            
+            # 3. 创建画布：每个N序列一个子图
+            fig, axes = plt.subplots(N_count, 1, figsize=(12, 4*N_count), dpi=100)
+            fig.suptitle(f'First Sample (Batch {batch_idx}): All N Sequences', 
+                        fontsize=16, fontweight='bold', y=0.98)
+            
+            # 4. 遍历第一个样本的每个N序列绘图
+            for n_idx in range(N_count):
+                ax = axes[n_idx] if N_count > 1 else axes  # 兼容N=1的情况
+                
+                # 提取单条序列数据
+                x_seq = x_first[n_idx]
+                trend_seq = trend_first[n_idx]
+                season_seq = season_first[n_idx]
+                
+                # 绘制三条曲线
+                ax.plot(x_seq, label='Original (x)', color='blue', linewidth=2, alpha=0.8)
+                ax.plot(trend_seq, label='Trend', color='red', linewidth=2, alpha=0.8, linestyle='--')
+                ax.plot(season_seq, label='Season', color='green', linewidth=2, alpha=0.8, linestyle=':')
+                
+                # 子图样式设置
+                ax.set_title(f'N = {n_idx}', fontsize=12)
+                ax.set_xlabel('Sequence Index (len)', fontsize=10)
+                ax.set_ylabel('Value', fontsize=10)
+                ax.legend(fontsize=9)
+                ax.grid(True, alpha=0.3)
+            
+            # 5. 调整布局并保存图片
+            plt.tight_layout(rect=[0, 0, 1, 0.96])
+            save_path = os.path.join(save_dir, f'first_sample_batch_{self.batch_num}_{layer_idx}.png')
+            plt.savefig(save_path, bbox_inches='tight')
+            plt.close(fig)  # 释放内存
+            
+            print(f"第一个样本的图片已保存至: {save_path}")
 
     def forward(self, x_list):
         length_list = []
@@ -231,30 +448,36 @@ class PastDecomposableMixing(nn.Module):
         # Decompose to obtain the season and trend
         out_season_list = []
         out_trend_list = []
+        out_season_noise_list = []
         index=0
         for x in x_list:
-            #print(f'xshape{x.shape}')
-            season, trend = self.decompsition(x)
-            #print(trend.shape)
-            # trend=self.Season_FC[index](trend)
-            # season=self.multigapattention2[index](season)
-            season=self.Season_FC[index](season)
-            trend=self.multigapattention2[index](trend)
+            # print(f'xshape{x.shape}')
+            season, trend, noise = self.decompsition(x)
+            # print(f'seasonshape{season.shape}')
+            # self.plot_first_sample_curves(x.permute(0, 2, 1), trend.permute(0, 2, 1), season.permute(0, 2, 1), index, save_dir="batch_plots_DFT_3")
+            trend=self.Trend_MLP[index](trend)
+            season=self.multigapattention2[index](season)
+            season_with_noise = self.rectified_layer[index](season + noise)
+            # season=self.Season_MLP[index](season)
+            # trend=self.multigapattention2[index](trend)
             # patch_trend=self.patchattention[index](trend)
             # trend=sub_trend+patch_trend
             index=index+1
 
             out_season_list.append(season)
             out_trend_list.append(trend)
-    
+            out_season_noise_list.append(season_with_noise)
+        self.batch_num += 1 
 
         out_list = []
-        for ori, out_season, out_trend, length in zip(x_list, out_season_list, out_trend_list,
+        layer_num = 0
+        for ori, out_season, out_trend, out_season_noise, length in zip(x_list, out_season_list, out_trend_list,out_season_noise_list,
                                                       length_list):
-            out = out_season + out_trend
+            out = out_season + out_trend + self.alpha[layer_num] * out_season_noise
             out = ori + self.out_cross_layer(out)
             # out = ori + self.out_cross_layer(ori)
             out_list.append(out[:, :length, :])
+            layer_num = layer_num + 1
         return out_list
 
 class Model(nn.Module):
@@ -398,361 +621,6 @@ class Model(nn.Module):
 
         return x_enc, x_mark_enc
 
-    def __multi_scale_process_inputs_avg(self, x_enc, x_mark_enc):
-        if self.configs.down_sampling_method == 'max':
-            down_pool = torch.nn.MaxPool1d(self.configs.down_sampling_window)
-        elif self.configs.down_sampling_method == 'avg':
-            #down_pool = torch.nn.AvgPool1d(self.configs.down_sampling_window)
-            down_pool=[2,4,8]          
-
-        elif self.configs.down_sampling_method == 'conv':
-            padding = 1 if torch.__version__ >= '1.5.0' else 2
-            down_pool = nn.Conv1d(in_channels=self.configs.enc_in, out_channels=self.configs.enc_in,
-                                  kernel_size=3, padding=padding,
-                                  stride=self.configs.down_sampling_window,
-                                  padding_mode='circular',
-                                  bias=False)
-        else:
-            return x_enc, x_mark_enc
-        # B,T,C -> B,C,T
-        x_enc = x_enc.permute(0, 2, 1)
-
-        x_enc_ori = x_enc
-        x_mark_enc_mark_ori = x_mark_enc
-
-        x_enc_sampling_list = []
-        x_mark_sampling_list = []
-        x_enc_sampling_list.append(x_enc.permute(0, 2, 1))
-        x_mark_sampling_list.append(x_mark_enc)
-
-        for i in range(self.configs.down_sampling_layers):
-            # print(x_enc_ori.shape)
-            x_enc_2d = x_enc_ori.cpu().numpy()  # 转换为 (batch_size, length)
-            blurred = np.array([cv2.blur(x_i, (down_pool[i],down_pool[i])) for x_i in x_enc_2d])  # 应用均值滤波
-            x_enc_sampling = torch.tensor(blurred).float().to(x_enc.device)  # 转换回 Tensor
-            # print(x_enc_sampling.shape)
-
-            x_enc_sampling_list.append(x_enc_sampling.permute(0, 2, 1))
-            x_enc_ori = x_enc_sampling
-            
-
-            if x_mark_enc_mark_ori is not None:
-                x_mark_sampling_list.append(x_mark_enc_mark_ori)
-                #x_mark_sampling_list.append(x_mark_enc_mark_ori[:, ::self.configs.down_sampling_window, :])
-                #x_mark_enc_mark_ori = x_mark_enc_mark_ori[:, ::self.configs.down_sampling_window, :]
-
-        x_enc = x_enc_sampling_list
-        if x_mark_enc_mark_ori is not None:
-            x_mark_enc = x_mark_sampling_list
-        else:
-            x_mark_enc = x_mark_enc
-
-        return x_enc, x_mark_enc
-
-    def __multi_scale_process_inputs_mid(self, x_enc, x_mark_enc):
-        if self.configs.down_sampling_method == 'max':
-            down_pool = torch.nn.MaxPool1d(self.configs.down_sampling_window)
-        elif self.configs.down_sampling_method == 'avg':
-            #down_pool = torch.nn.AvgPool1d(self.configs.down_sampling_window)
-            down_pool=[3,5,7]          
-
-        elif self.configs.down_sampling_method == 'conv':
-            padding = 1 if torch.__version__ >= '1.5.0' else 2
-            down_pool = nn.Conv1d(in_channels=self.configs.enc_in, out_channels=self.configs.enc_in,
-                                  kernel_size=3, padding=padding,
-                                  stride=self.configs.down_sampling_window,
-                                  padding_mode='circular',
-                                  bias=False)
-        else:
-            return x_enc, x_mark_enc
-        # B,T,C -> B,C,T
-        x_enc = x_enc.permute(0, 2, 1)
-
-        x_enc_ori = x_enc
-        x_mark_enc_mark_ori = x_mark_enc
-
-        x_enc_sampling_list = []
-        x_mark_sampling_list = []
-        x_enc_sampling_list.append(x_enc.permute(0, 2, 1))
-        x_mark_sampling_list.append(x_mark_enc)
-
-        for i in range(self.configs.down_sampling_layers):
-            # print(x_enc_ori.shape)
-            x_enc_2d = x_enc_ori.cpu().numpy()  # 转换为 (batch_size, length)
-            blurred = np.array([medfilt2d(x_i, down_pool[i]) for x_i in x_enc_2d])  # 应用中值滤波
-            x_enc_sampling = torch.tensor(blurred).float().to(x_enc.device)  # 转换回 Tensor
-            # print(x_enc_sampling.shape)
-
-            x_enc_sampling_list.append(x_enc_sampling.permute(0, 2, 1))
-            x_enc_ori = x_enc_sampling
-            
-
-            if x_mark_enc_mark_ori is not None:
-                x_mark_sampling_list.append(x_mark_enc_mark_ori)
-                #x_mark_sampling_list.append(x_mark_enc_mark_ori[:, ::self.configs.down_sampling_window, :])
-                #x_mark_enc_mark_ori = x_mark_enc_mark_ori[:, ::self.configs.down_sampling_window, :]
-
-        x_enc = x_enc_sampling_list
-        if x_mark_enc_mark_ori is not None:
-            x_mark_enc = x_mark_sampling_list
-        else:
-            x_mark_enc = x_mark_enc
-
-        return x_enc, x_mark_enc
-
-    def __multi_scale_process_inputs_gauss(self, x_enc, x_mark_enc):
-        if self.configs.down_sampling_method == 'max':
-            down_pool = torch.nn.MaxPool1d(self.configs.down_sampling_window)
-        elif self.configs.down_sampling_method == 'avg':
-            #down_pool = torch.nn.AvgPool1d(self.configs.down_sampling_window)
-            down_pool=[3,5,7]          
-
-        elif self.configs.down_sampling_method == 'conv':
-            padding = 1 if torch.__version__ >= '1.5.0' else 2
-            down_pool = nn.Conv1d(in_channels=self.configs.enc_in, out_channels=self.configs.enc_in,
-                                  kernel_size=3, padding=padding,
-                                  stride=self.configs.down_sampling_window,
-                                  padding_mode='circular',
-                                  bias=False)
-        else:
-            return x_enc, x_mark_enc
-        # B,T,C -> B,C,T
-        x_enc = x_enc.permute(0, 2, 1)
-
-        x_enc_ori = x_enc
-        x_mark_enc_mark_ori = x_mark_enc
-
-        x_enc_sampling_list = []
-        x_mark_sampling_list = []
-        x_enc_sampling_list.append(x_enc.permute(0, 2, 1))
-        x_mark_sampling_list.append(x_mark_enc)
-
-        for i in range(self.configs.down_sampling_layers):
-            # print(x_enc_ori.shape)
-            x_enc_2d = x_enc_ori.cpu().numpy()  # 转换为 (batch_size, length)
-            blurred = np.array([cv2.GaussianBlur(x_i, (down_pool[i],down_pool[i]),0) for x_i in x_enc_2d])  # 应用高斯滤波
-            x_enc_sampling = torch.tensor(blurred).float().to(x_enc.device)  # 转换回 Tensor
-            # print(x_enc_sampling.shape)
-
-            x_enc_sampling_list.append(x_enc_sampling.permute(0, 2, 1))
-            x_enc_ori = x_enc_sampling
-            
-
-            if x_mark_enc_mark_ori is not None:
-                x_mark_sampling_list.append(x_mark_enc_mark_ori)
-                #x_mark_sampling_list.append(x_mark_enc_mark_ori[:, ::self.configs.down_sampling_window, :])
-                #x_mark_enc_mark_ori = x_mark_enc_mark_ori[:, ::self.configs.down_sampling_window, :]
-
-        x_enc = x_enc_sampling_list
-        if x_mark_enc_mark_ori is not None:
-            x_mark_enc = x_mark_sampling_list
-        else:
-            x_mark_enc = x_mark_enc
-
-        return x_enc, x_mark_enc
-
-    def __multi_scale_process_inputs_bilateral(self, x_enc, x_mark_enc):
-        if self.configs.down_sampling_method == 'max':
-            down_pool = torch.nn.MaxPool1d(self.configs.down_sampling_window)
-        elif self.configs.down_sampling_method == 'avg':
-            #down_pool = torch.nn.AvgPool1d(self.configs.down_sampling_window)
-            down_pool=[2,4,8]          
-
-        elif self.configs.down_sampling_method == 'conv':
-            padding = 1 if torch.__version__ >= '1.5.0' else 2
-            down_pool = nn.Conv1d(in_channels=self.configs.enc_in, out_channels=self.configs.enc_in,
-                                  kernel_size=3, padding=padding,
-                                  stride=self.configs.down_sampling_window,
-                                  padding_mode='circular',
-                                  bias=False)
-        else:
-            return x_enc, x_mark_enc
-        # B,T,C -> B,C,T
-        x_enc = x_enc.permute(0, 2, 1)
-
-        x_enc_ori = x_enc
-        x_mark_enc_mark_ori = x_mark_enc
-
-        x_enc_sampling_list = []
-        x_mark_sampling_list = []
-        x_enc_sampling_list.append(x_enc.permute(0, 2, 1))
-        x_mark_sampling_list.append(x_mark_enc)
-
-        for i in range(self.configs.down_sampling_layers):
-            # print(x_enc_ori.shape)
-            x_enc_2d = x_enc_ori.cpu().numpy()  # 转换为 (batch_size, length)
-            blurred = np.array([cv2.bilateralFilter(x_i, d=down_pool[i], sigmaColor=75, sigmaSpace=75) for x_i in x_enc_2d])  # 应用均值滤波
-            x_enc_sampling = torch.tensor(blurred).float().to(x_enc.device)  # 转换回 Tensor
-            # print(x_enc_sampling.shape)
-
-            x_enc_sampling_list.append(x_enc_sampling.permute(0, 2, 1))
-            x_enc_ori = x_enc_sampling
-            
-
-            if x_mark_enc_mark_ori is not None:
-                x_mark_sampling_list.append(x_mark_enc_mark_ori)
-                #x_mark_sampling_list.append(x_mark_enc_mark_ori[:, ::self.configs.down_sampling_window, :])
-                #x_mark_enc_mark_ori = x_mark_enc_mark_ori[:, ::self.configs.down_sampling_window, :]
-
-        x_enc = x_enc_sampling_list
-        if x_mark_enc_mark_ori is not None:
-            x_mark_enc = x_mark_sampling_list
-        else:
-            x_mark_enc = x_mark_enc
-
-        return x_enc, x_mark_enc
-
-    def __multi_scale_process_inputs_guide(self, x_enc, x_mark_enc):
-        if self.configs.down_sampling_method == 'max':
-            down_pool = torch.nn.MaxPool1d(self.configs.down_sampling_window)
-        elif self.configs.down_sampling_method == 'avg':
-            #down_pool = torch.nn.AvgPool1d(self.configs.down_sampling_window)
-            down_pool=[2,4,8]          
-
-        elif self.configs.down_sampling_method == 'conv':
-            padding = 1 if torch.__version__ >= '1.5.0' else 2
-            down_pool = nn.Conv1d(in_channels=self.configs.enc_in, out_channels=self.configs.enc_in,
-                                  kernel_size=3, padding=padding,
-                                  stride=self.configs.down_sampling_window,
-                                  padding_mode='circular',
-                                  bias=False)
-        else:
-            return x_enc, x_mark_enc
-        # B,T,C -> B,C,T
-        x_enc = x_enc.permute(0, 2, 1)
-
-        x_enc_ori = x_enc
-        x_mark_enc_mark_ori = x_mark_enc
-
-        x_enc_sampling_list = []
-        x_mark_sampling_list = []
-        x_enc_sampling_list.append(x_enc.permute(0, 2, 1))
-        x_mark_sampling_list.append(x_mark_enc)
-        
-        for i in range(self.configs.down_sampling_layers):
-            # print(x_enc_ori.shape)
-            x_enc_2d = x_enc_ori.cpu().numpy()  # 转换为 (batch_size, length)
-            blurred = np.array([cv2.ximgproc.createGuidedFilter(guide=x_i, radius=down_pool[i], eps=0.1).filter(x_i) for x_i in x_enc_2d])  # 应用均值滤波
-            x_enc_sampling = torch.tensor(blurred).float().to(x_enc.device)  # 转换回 Tensor
-            # print(x_enc_sampling.shape)
-
-            x_enc_sampling_list.append(x_enc_sampling.permute(0, 2, 1))
-            x_enc_ori = x_enc_sampling
-            
-
-            if x_mark_enc_mark_ori is not None:
-                x_mark_sampling_list.append(x_mark_enc_mark_ori)
-                #x_mark_sampling_list.append(x_mark_enc_mark_ori[:, ::self.configs.down_sampling_window, :])
-                #x_mark_enc_mark_ori = x_mark_enc_mark_ori[:, ::self.configs.down_sampling_window, :]
-
-        x_enc = x_enc_sampling_list
-        if x_mark_enc_mark_ori is not None:
-            x_mark_enc = x_mark_sampling_list
-        else:
-            x_mark_enc = x_mark_enc
-
-        return x_enc, x_mark_enc
-
-    def __multi_scale_process_inputs_FFT_o(self, x_enc, x_mark_enc):
-        # B,T,C -> B,C,T
-        x_enc = x_enc.permute(0, 2, 1)
-
-        x_enc_ori = x_enc
-        x_mark_enc_mark_ori = x_mark_enc
-
-        x_enc_sampling_list = []
-        x_mark_sampling_list = []
-        x_enc_sampling_list.append(x_enc.permute(0, 2, 1))
-        x_mark_sampling_list.append(x_mark_enc)
-
-            # 对 x_enc 做快速傅里叶变换
-        xf = torch.fft.rfft(x_enc, dim=-1)  # 在时间维度做 rFFT
-
-        # 获取频率的平均幅值，用于选取主频分量
-        freq_amplitude = torch.abs(xf).mean(dim=(0, 1))  # [Freq]
-
-        # 忽略直流分量
-        freq_amplitude[0] = 0
-
-        # 找出 top-k 强频率位置
-        k = self.configs.down_sampling_layers
-        _, top_indices = torch.topk(freq_amplitude, k)
-
-        # 构造掩码，仅保留 top-k 频率，其余置为 0
-        device = xf.device
-        mask = torch.zeros_like(xf, dtype=torch.bool)
-        for idx in top_indices:
-            mask[:, :, idx] = True
-
-        # 对每个频率分量做 iFFT 还原回时域信号
-        for idx in top_indices:
-            filtered_xf = torch.zeros_like(xf)
-            filtered_xf[:, :, idx] = xf[:, :, idx]  # 保留单个频率分量
-            x_filtered = torch.fft.irfft(filtered_xf, n=x_enc.size(-1), dim=-1)
-            x_enc_sampling_list.append(x_filtered.permute(0, 2, 1))  # 转为 [B, T, C]
-
-        for i in range(self.configs.down_sampling_layers):
-            if x_mark_enc_mark_ori is not None:
-                x_mark_sampling_list.append(x_mark_enc_mark_ori)
-
-        x_enc = x_enc_sampling_list
-        if x_mark_enc_mark_ori is not None:
-            x_mark_enc = x_mark_sampling_list
-        else:
-            x_mark_enc = x_mark_enc
-
-        return x_enc, x_mark_enc
-    
-    def __multi_scale_process_inputs_FFT(self, x_enc, x_mark_enc):
-        # B,T,C -> B,C,T
-        x_enc = x_enc.permute(0, 2, 1)
-
-        x_enc_ori = x_enc
-        x_mark_enc_mark_ori = x_mark_enc
-
-        x_enc_sampling_list = []
-        x_mark_sampling_list = []
-        # x_enc_sampling_list.append()
-        x_mark_sampling_list.append(x_mark_enc)
-
-            # 对 x_enc 做快速傅里叶变换
-        xf = torch.fft.rfft(x_enc, dim=-1)  # 在时间维度做 rFFT
-
-        # 获取频率的平均幅值，用于选取主频分量
-        freq_amplitude = torch.abs(xf).mean(dim=(0, 1))  # [Freq]
-
-        # 忽略直流分量
-        freq_amplitude[0] = 0
-
-        # 找出 top-k 强频率位置
-        k = self.configs.down_sampling_layers+1
-        _, top_indices = torch.topk(freq_amplitude, k)
-
-        # 构造掩码，仅保留 top-k 频率，其余置为 0
-        device = xf.device
-        mask = torch.zeros_like(xf, dtype=torch.bool)
-        for idx in top_indices:
-            mask[:, :, idx] = True
-
-        # 对每个频率分量做 iFFT 还原回时域信号
-        for idx in top_indices:
-            filtered_xf = torch.zeros_like(xf)
-            filtered_xf[:, :, idx] = xf[:, :, idx]  # 保留单个频率分量
-            x_filtered = torch.fft.irfft(filtered_xf, n=x_enc.size(-1), dim=-1)
-            x_enc_sampling_list.append(x_filtered.permute(0, 2, 1))  # 转为 [B, T, C]
-
-        for i in range(self.configs.down_sampling_layers):
-            if x_mark_enc_mark_ori is not None:
-                x_mark_sampling_list.append(x_mark_enc_mark_ori)
-
-        x_enc = x_enc_sampling_list
-        if x_mark_enc_mark_ori is not None:
-            x_mark_enc = x_mark_sampling_list
-        else:
-            x_mark_enc = x_mark_enc
-
-        return x_enc, x_mark_enc
-
     def forecast(self, x_enc, x_mark_enc, x_dec, x_mark_dec):
         x_enc, x_mark_enc = self.__multi_scale_process_inputs(x_enc, x_mark_enc)
         
@@ -842,75 +710,8 @@ class Model(nn.Module):
 
     def forward(self, x_enc, x_mark_enc, x_dec, x_mark_dec, mask=None):
         if self.task_name == 'long_term_forecast' or self.task_name == 'short_term_forecast':
-            #时序数据（0，seq）,时间数据（0，seq）,时序数据（seq-label，seq+pred），时间数据（seq-label，seq+pred)
+            #时序数据（0，seq),时间数据（0，seq),时序数据（seq-label，seq+pred)，时间数据（seq-label，seq+pred)
             dec_out_list = self.forecast(x_enc, x_mark_enc, x_dec, x_mark_dec)
             return dec_out_list
         else:
             raise ValueError('Only forecast tasks implemented yet')
-
-
-class Normalize(nn.Module):
-    def __init__(self, num_features: int, eps=1e-5, affine=False, subtract_last=False, non_norm=False):
-        """
-        :param num_features: the number of features or channels
-        :param eps: a value added for numerical stability
-        :param affine: if True, RevIN has learnable affine parameters
-        """
-        super(Normalize, self).__init__()
-        self.num_features = num_features
-        self.eps = eps
-        self.affine = affine
-        self.subtract_last = subtract_last
-        self.non_norm = non_norm
-        if self.affine:
-            self._init_params()
-
-    def forward(self, x, mode: str):
-        if mode == 'norm':
-            self._get_statistics(x)
-            x = self._normalize(x)
-        elif mode == 'denorm':
-            x = self._denormalize(x)
-        else:
-            raise NotImplementedError
-        return x
-
-    def _init_params(self):
-        # initialize RevIN params: (C,)
-        self.affine_weight = nn.Parameter(torch.ones(self.num_features))
-        self.affine_bias = nn.Parameter(torch.zeros(self.num_features))
-
-    def _get_statistics(self, x):
-        #ndim为张量的维数，此处x.ndim=3
-        dim2reduce = tuple(range(1, x.ndim - 1))
-        if self.subtract_last:
-            self.last = x[:, -1, :].unsqueeze(1)
-        else:
-            self.mean = torch.mean(x, dim=dim2reduce, keepdim=True).detach()#dim2reduce其实就是1，也就是在时间上归一化
-        self.stdev = torch.sqrt(torch.var(x, dim=dim2reduce, keepdim=True, unbiased=False) + self.eps).detach()
-
-    def _normalize(self, x):
-        if self.non_norm:
-            return x
-        if self.subtract_last:
-            x = x - self.last
-        else:
-            x = x - self.mean
-        x = x / self.stdev
-        if self.affine:
-            x = x * self.affine_weight
-            x = x + self.affine_bias
-        return x
-
-    def _denormalize(self, x):
-        if self.non_norm:
-            return x
-        if self.affine:
-            x = x - self.affine_bias
-            x = x / (self.affine_weight + self.eps * self.eps)
-        x = x * self.stdev
-        if self.subtract_last:
-            x = x + self.last
-        else:
-            x = x + self.mean
-        return x

@@ -5,6 +5,7 @@ from sklearn.cluster import AgglomerativeClustering, KMeans, SpectralClustering
 from layers.Autoformer_EncDec import series_decomp
 from layers.Embed import DataEmbedding_wo_pos
 from layers.StandardNorm import Normalize
+from layers.Plugs import FrequencyResidualCalibrator, TrendAwareSinglePatchAugmenter, TrendAwareCrossPatchAugmenter, TrendAwarePearsonAugmenter_CI, TrendAwarePearsonAugmenter_CD
 
 
 class MultiScaleSeasonMixing(nn.Module):
@@ -160,7 +161,7 @@ class PastDecomposableMixing(nn.Module):
         return out_list
 
 class PatchMLP(nn.Module):
-    def __init__(self, dim, hidden=None, dropout=0.0):
+    def __init__(self, dim, out_dim, hidden=None, dropout=0.0):
         super(PatchMLP, self).__init__()
         if hidden is None:
             hidden = max(16, dim // 2)
@@ -168,9 +169,9 @@ class PatchMLP(nn.Module):
             nn.Linear(dim, hidden),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden, dim),
+            nn.Linear(hidden, out_dim),
         )
-        self.norm = nn.LayerNorm(dim)
+        self.norm = nn.LayerNorm(out_dim)
 
     def forward(self, x):
         # x: [L]
@@ -193,17 +194,29 @@ class Model(nn.Module):
 
         self.preprocess = series_decomp(configs.moving_avg)
         self.enc_in = configs.enc_in
+        self.use_future_temporal_feature = configs.use_future_temporal_feature
         self.global_patch = configs.global_patch
+        self.agg_patch = configs.agg_patch
 
-        self.P_per_channel = configs.seq_len // configs.global_patch
+        self.P_per_channel = configs.seq_len // configs.agg_patch
         self.patch_count = configs.enc_in * self.P_per_channel  # configs.enc_in * (seq_len//global_patch)
          # 为每个目标 patch m 初始化 self.patch_count 个线性层：self.patch_linears[m][j]
         # 结构为 ModuleList[ M ]，每项为 ModuleList[ M ] 的 nn.Linear(L->L)
         self.patch_linears = nn.ModuleList(
-            [nn.ModuleList([PatchMLP(self.global_patch, hidden=self.global_patch//2, dropout=0.1)
+            [nn.ModuleList([PatchMLP(self.agg_patch, self.agg_patch, hidden=self.agg_patch//2, dropout=0.1)
                             for _ in range(self.patch_count)])
              for _ in range(self.patch_count)]
         )
+
+        # self.patch_weights = nn.ModuleList(
+        #     [nn.ModuleList([PatchMLP(self.agg_patch, hidden=self.agg_patch//2, dropout=0.1)
+        #                     for _ in range(self.patch_count)])
+        #      for _ in range(self.patch_count)]
+        # )
+
+        self.out_mlp = PatchMLP(self.agg_patch, self.agg_patch, hidden=self.agg_patch//2, dropout=0.1)
+
+        self.patch_augmenter = TrendAwarePearsonAugmenter_CD(configs.agg_patch, configs.agg_patch*2, dropout=0.1)
 
         if self.channel_independence:
             self.enc_embedding = DataEmbedding_wo_pos(1, configs.d_model, configs.embed, configs.freq,
@@ -627,7 +640,7 @@ class Model(nn.Module):
         # 确认已按 configs 初始化好 self.patch_linears，数量应等于 M
         if self.patch_linears is None or len(self.patch_linears) != M:
             raise RuntimeError(f"patch_linears size ({None if self.patch_linears is None else len(self.patch_linears)}) != current M ({M}). "
-                               "请在 __init__ 中按 configs 初始化 patch_linears 为长度 enc_in*(seq_len//global_patch)。")
+                               "请在 __init__ 中按 configs 初始化 patch_linears 为长度 enc_in*(seq_len//agg_patch)。")
 
         for b in range(B):
             groups = groups_all[b]
@@ -663,50 +676,128 @@ class Model(nn.Module):
                     out[b, m] = self_vec + sum_trans
 
         return out
+    def group_aggregate_mask(self, X, groups_all):
+        """
+        使用原始 patch 矩阵 X（而非之前 compute_group_reference_and_offsets 返回的 aligned）进行聚合。
+        X: Tensor [B, M, L]
+        groups_all: list length B，每项为该样本的 groups（每个 group 为 patch 索引列表）
+        聚合规则（按你要求）：
+          对每个目标 patch m:
+            out[b,m] = X[b,m] + sum_{j in same_group, j!=m} self.patch_linears[m][j]( MASK_{m}( X[b,j] ) )
+          MASK_{m}(X[b,j])：第0位保留；对于 k>=1，若 sign( X[b,m][k]-X[b,m][k-1] ) == sign( X[b,j][k]-X[b,j][k-1] ) 则保留该位，否则置0。
+        返回: out Tensor [B, M, L]
+        """
+        B, M, L = X.shape
+        device = X.device
+        out = torch.zeros_like(X)
 
-    def lag_move(self, x):
+        if self.patch_linears is None or len(self.patch_linears) != M:
+            raise RuntimeError(f"patch_linears size ({None if self.patch_linears is None else len(self.patch_linears)}) != current M ({M}).")
+
+        for b in range(B):
+            Xb = X[b]  # [M, L]
+            groups = groups_all[b]
+            # 构建 idx->group 映射
+            idx2grp = [-1] * M
+            for gi, grp in enumerate(groups):
+                for idx in grp:
+                    idx2grp[int(idx)] = gi
+
+            for m in range(M):
+                p0 = Xb[m]  # [L]
+                gi = idx2grp[m]
+                if gi == -1:
+                    out[b, m] = p0
+                    continue
+
+                # 计算 p0 的符号向量（长度 L-1）
+                if L >= 2:
+                    sign0 = torch.sign(p0[1:] - p0[:-1])  # {-1,0,1}, device 与 dtype 保持 torch 默认
+                else:
+                    sign0 = None
+
+                grp = groups[gi]
+                sum_trans = None
+                for j in grp:
+                    j = int(j)
+                    if j == m:
+                        continue
+                    pj = Xb[j]  # [L]
+                    # 构造 mask：第0位为1，其余根据符号比较决定
+                    if sign0 is not None:
+                        signj = torch.sign(pj[1:] - pj[:-1])
+                        equal = (signj == sign0)  # [L-1] bool
+                        mask = torch.ones(L, device=device, dtype=pj.dtype)
+                        mask[1:] = equal.to(pj.dtype)
+                    else:
+                        mask = torch.ones(L, device=device, dtype=pj.dtype)
+                    
+                    mlp_pj = self.patch_linears[m][j](pj)  # [L]
+                    trans = mlp_pj * mask  # [L]
+                    # 用目标 m 对应的第 j 个映射对 masked 进行变换
+                    
+                    if sum_trans is None:
+                        sum_trans = trans
+                    else:
+                        sum_trans = sum_trans + trans
+
+                if sum_trans is None:
+                    out[b, m] = p0
+                else:
+                    out[b, m] = p0 + sum_trans
+
+        return out
+
+    def pre_process(self, x):
         ori_x = x
         # print('x shape before lag move:', x.size())
         x=x.permute(0,2,1).contiguous()
-        patches = x.unfold(dimension=-1, size=self.global_patch, step=self.global_patch)  # (B, C, num_patches, patch_size)
+        patches = x.unfold(dimension=-1, size=self.agg_patch, step=self.agg_patch)  # (B, C, num_patches, patch_size)
         # print('patches shape after lag move:', patches.size())
 
         B, C, P, L = patches.shape
         if L < 2:
             raise ValueError("patch length L must be >= 2 for correlation")
-        # 合并 batch 和 channel 便于向量化： [B*C, P, L]
+        # 求各个patch之间的皮尔逊相关系数矩阵
         X = patches.reshape(B , C*P, L).float()
         # 去均值
         mean = X.mean(dim=-1, keepdim=True)               # [B, C*P, 1]
         Xc = X - mean                                     # [B, C*P, L]
-        # 协方差分子：每个样本内部做矩阵乘 -> [B, C*P, C*P]
+        # 分子：每个样本内部做矩阵乘 -> [B, C*P, C*P]
         num = torch.matmul(Xc, Xc.transpose(1, 2)) / (L - 1)
         # 标准差： [B, C*P]
         std = Xc.std(dim=-1, unbiased=True).clamp(min=1e-8)
         denom = std[:, :, None] * std[:, None, :]         # [B, C*P, C*P]
         corr = num / denom                                # [B, C*P, C*P]
-        # 皮尔逊相关系数矩阵 
-        # corr=corr.reshape(B, C, P, C*P)
-        # print('corr shape:', corr.size())
-        patch_groups = self.group_patches(corr, method='threshold', threshold=0.6, min_size=1)
+        
+        patch_groups = self.group_patches(corr, method='threshold', threshold=0.8, min_size=1)
+        # print('patch groups:', patch_groups)
         
         # 基准向量，偏移量，和对齐后的 patch
-        refs_all, offsets, aligned = self.compute_group_reference_and_offsets(patches, patch_groups, max_shift = 2, ref_method='medoid', fill_method='interp')
+        # refs_all, offsets, aligned = self.compute_group_reference_and_offsets(patches, patch_groups, max_shift = 0, ref_method='medoid', fill_method='interp')
 
-        processed_aligned = self.group_aggregate(aligned, patch_groups)
+        # processed_aligned = self.group_aggregate(aligned, patch_groups)
 
-        self.patch_offsets = offsets  # [B, M]
-        self.aligned_patches = processed_aligned.reshape(B, C, P, L).reshape(B,C,P*L)
-        # print('aligned patches shape:', self.aligned_patches.size())
+        # self.patch_offsets = offsets  # [B, M]
+        # 直接使用原始 X（未对齐的 patch）进行组内聚合
+        processed = self.group_aggregate_mask(X, patch_groups)  # [B, M, L]
 
-        lag_x = self.aligned_patches.permute(0,2,1).contiguous()
-        return lag_x
+        # 将 processed 还原回 (B, C, P, L) -> (B, C, P*L) -> (B, P*L, C) 与原始 ori_x 形状对齐
+        processed_patches = processed.reshape(B, C, P, L)  # [B, C, P, L]
+        self.aligned_patches = processed_patches.reshape(B, C, P * L)  # [B, C, P*L]
+
+        # 输出回原始时间序列格式 B,T,C 以供后续流程
+        aggregated_x = self.aligned_patches.permute(0, 2, 1).contiguous()  # [B, T, C]
+        return aggregated_x, patch_groups
         
 
     def forecast(self, x_enc, x_mark_enc, x_dec, x_mark_dec):
-        #B,T,N
-        x_enc = self.lag_move(x_enc)
-        print('series lag moved')
+        # print('Input x_enc shape:', x_enc.size())
+        # #B,T,N
+        # x_enc, patch_groups = self.pre_process(x_enc)
+        # print('series pre_processed')
+        x_enc = self.patch_augmenter(x_enc)
+        # print('series pre_processed')
 
         x_enc, x_mark_enc = self.__multi_scale_process_inputs(x_enc, x_mark_enc)
 
@@ -735,6 +826,7 @@ class Model(nn.Module):
         if x_mark_enc is not None:
             for i, x, x_mark in zip(range(len(x_list[0])), x_list[0], x_mark_list):
                 enc_out = self.enc_embedding(x, x_mark)  # [B,T,C]
+                # print('enc_out shape:', enc_out.size())
                 enc_out_list.append(enc_out)
         else:
             for i, x in zip(range(len(x_list[0])), x_list[0]):
@@ -751,6 +843,50 @@ class Model(nn.Module):
         dec_out = torch.stack(dec_out_list, dim=-1).sum(-1)
         dec_out = self.normalize_layers[0](dec_out, 'denorm')
         return dec_out
+
+    def group_aggregate_mlp(self, enc_out, patch_groups):
+        """
+        enc_out: [B, T, C] (后续按 agg_patch 切成 patch)
+        patch_groups: list len B，每项为该样本的 groups（group 为 patch 索引列表）
+        返回 patches_out: 与 enc_out 同形 [B, T, C]，同组内每个 patch 经过 self.group_mlp 映射
+        """
+        B, T, C = enc_out.shape
+        device = enc_out.device
+        # 转为 [B, M, L]
+        enc_ct = enc_out.permute(0, 2, 1).contiguous()   # [B, C, T]
+        patches = enc_ct.unfold(dimension=-1, size=self.agg_patch, step=self.agg_patch)  # [B, C, P, L]
+        Bp, Cc, P, L = patches.shape
+        M = Cc * P
+        X = patches.reshape(Bp, M, L)  # [B, M, L]
+        out = X.new_zeros(X.shape)
+
+        # 遍历 batch，按 group 对成员逐 patch 应用同一层 MLP（对每个 patch 的时间维映射）
+        for b in range(Bp):
+            Xb = X[b]  # [M, L]
+            groups = patch_groups[b]
+            # idx->group 映射（可选）
+            idx2grp = [-1] * M
+            for gi, grp in enumerate(groups):
+                for idx in grp:
+                    idx2grp[int(idx)] = gi
+            # 对每个组进行处理
+            for grp in groups:
+                if len(grp) == 0:
+                    continue
+                members = [int(i) for i in grp]
+                g = Xb[members]            # [G, L]
+                # 用同一层 mlp 逐行映射（nn.Linear 支持 (..., L) 输入）
+                g_out = self.out_mlp(g)  # [G, L]
+                out[b, members] = g_out
+            # 对未分组的 patch 直接保留原值
+            for m in range(M):
+                if idx2grp[m] == -1:
+                    out[b, m] = Xb[m]
+
+        # 恢复到 [B, T, C]
+        processed_patches = out.reshape(Bp, Cc, P, L)  # [B, C, P, L]
+        patches_out = processed_patches.reshape(Bp, Cc, P * L).permute(0, 2, 1).contiguous()  # [B, T, C]
+        return patches_out
 
     def future_multi_mixing(self, B, enc_out_list, x_list):
         dec_out_list = []

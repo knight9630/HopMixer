@@ -17,7 +17,7 @@ class GapAttention(nn.Module):
         self.gapdis=gapdis
         self.multiattention_layers = torch.nn.ModuleList(
                 [
-                    nn.MultiheadAttention(embed_dim=self.gapdis, num_heads=1)
+                    nn.MultiheadAttention(embed_dim=self.gapdis, num_heads=1, batch_first=True)
                     for i in range(self.daytime//self.gapdis)
                 ]
             )

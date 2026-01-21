@@ -10,7 +10,7 @@ random.seed(fix_seed)
 torch.manual_seed(fix_seed)
 np.random.seed(fix_seed)
 
-parser = argparse.ArgumentParser(description='TimeMixer')
+parser = argparse.ArgumentParser(description='TimeMixer for Time Series Forecasting')
 
 # ETTh1 24,12
 # ETTh2 48,6
@@ -20,8 +20,8 @@ parser = argparse.ArgumentParser(description='TimeMixer')
 parser.add_argument('--task_name', type=str, default='long_term_forecast',
                     help='task name, options:[long_term_forecast, short_term_forecast, imputation, classification, anomaly_detection]')
 parser.add_argument('--is_training', type=int, default=1, help='status')
-parser.add_argument('--model_id', type=str, default='TimeMixer', help='model id')
-parser.add_argument('--model', type=str, default='TimeMixer',
+parser.add_argument('--model_id', type=str, default='HopMixer', help='model id')
+parser.add_argument('--model', type=str, default='HopMixer',
                     help='model name, options: [TimeMixer,HopMixer]')
 
 # data loader
@@ -41,11 +41,15 @@ parser.add_argument('--label_len', type=int, default=0, help='start token length
 parser.add_argument('--pred_len', type=int, default=720, help='prediction sequence length')
 parser.add_argument('--seasonal_patterns', type=str, default='Monthly', help='subset for M4')
 parser.add_argument('--inverse', action='store_true', help='inverse output data', default=False)
-parser.add_argument('--global_patch', type=int, default=48, help='global patch length')
+parser.add_argument('--agg_patch', type=int, default=12, help='global patch length')
+parser.add_argument('--global_patch', type=int, default=24, help='global patch length')
 parser.add_argument('--local_patch', type=int, default=12, help='local patch length')
 
 # model define
 parser.add_argument('--top_k', type=int, default=5, help='for TimesBlock')
+parser.add_argument('--top_k_season', type=int, default=5, help='for ThreePartDFTDecomp')
+parser.add_argument('--top_k_trend', type=int, default=3, help='for ThreePartDFTDecomp')
+parser.add_argument('--agg_top_k', type=int, default=4, help='for ThreePartDFTDecomp')
 parser.add_argument('--num_kernels', type=int, default=6, help='for Inception')
 parser.add_argument('--enc_in', type=int, default=7, help='encoder input size')
 parser.add_argument('--dec_in', type=int, default=7, help='decoder input size')
@@ -58,7 +62,7 @@ parser.add_argument('--e_layers', type=int, default=2, help='num of encoder laye
 parser.add_argument('--d_layers', type=int, default=1, help='num of decoder layers')
 parser.add_argument('--d_ff', type=int, default=32, help='dimension of fcn')
 parser.add_argument('--moving_avg', type=int, default=25, help='window size of moving average')#原25
-parser.add_argument('--factor', type=int, default=3, help='attn factor')
+parser.add_argument('--factor', type=int, default=5, help='attn factor')
 parser.add_argument('--distil', action='store_false',
                     help='whether to use distilling in encoder, using this argument means not using distilling',
                     default=True)
@@ -69,8 +73,8 @@ parser.add_argument('--activation', type=str, default='gelu', help='activation')
 parser.add_argument('--output_attention', action='store_true', help='whether to output attention in ecoder')
 parser.add_argument('--channel_independence', type=int, default=1,
                     help='0: channel dependence 1: channel independence for FreTS model')#对单变量进行嵌入
-parser.add_argument('--decomp_method', type=str, default='moving_avg',
-                    help='method of series decompsition, only support moving_avg or dft_decomp')
+parser.add_argument('--decomp_method', type=str, default='three_part_dft_decomp',
+                    help='oving_avg ,dft_decomp or three_part_dft_decomp')
 parser.add_argument('--use_norm', type=int, default=1, help='whether to use normalize; True 1 False 0')#0会跳过归一化
 parser.add_argument('--down_sampling_layers', type=int, default=3, help='num of down sampling layers')#3
 parser.add_argument('--down_sampling_window', type=int, default=2, help='down sampling window size')
@@ -111,7 +115,7 @@ if args.use_gpu and args.use_multi_gpu:
     args.devices = args.devices.replace(' ', '')
     device_ids = args.devices.split(',')
     #args.device_ids = [int(id_) for id_ in device_ids]
-    args.device_ids = [int(device_ids[i]) for i in range(0,1)]
+    args.device_ids = [int(device_ids[i]) for i in range(1,2)]
     args.gpu = args.device_ids[0]
 
 print('Args in experiment:')
