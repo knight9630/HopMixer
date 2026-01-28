@@ -13,7 +13,7 @@ np.random.seed(fix_seed)
 parser = argparse.ArgumentParser(description='TimeMixer for Time Series Forecasting')
 
 # ETTh1 24,12
-# ETTh2 48,6
+# ETTh2 48,6(bs=256,GPU0,1)
 # ETTm1&2 24,8
 
 # basic config
@@ -25,9 +25,9 @@ parser.add_argument('--model', type=str, default='HopMixer',
                     help='model name, options: [TimeMixer,HopMixer]')
 
 # data loader
-parser.add_argument('--data', type=str, default='ETTh1', help='dataset type')
+parser.add_argument('--data', type=str, default='ETTh2', help='dataset type')
 parser.add_argument('--root_path', type=str, default='../data/ETT/', help='root path of the data file')
-parser.add_argument('--data_path', type=str, default='ETTh1.csv', help='data file')
+parser.add_argument('--data_path', type=str, default='ETTh2.csv', help='data file')
 parser.add_argument('--features', type=str, default='M',
                     help='forecasting task, options:[M, S, MS]; M:multivariate predict multivariate, S:univariate predict univariate, MS:multivariate predict univariate')
 parser.add_argument('--target', type=str, default='OT', help='target feature in S or MS task')
@@ -38,18 +38,18 @@ parser.add_argument('--checkpoints', type=str, default='../Hop_checkpoints/', he
 # forecasting task
 parser.add_argument('--seq_len', type=int, default=96, help='input sequence length')
 parser.add_argument('--label_len', type=int, default=0, help='start token length')
-parser.add_argument('--pred_len', type=int, default=720, help='prediction sequence length')
+parser.add_argument('--pred_len', type=int, default= 720, help='prediction sequence length')
 parser.add_argument('--seasonal_patterns', type=str, default='Monthly', help='subset for M4')
 parser.add_argument('--inverse', action='store_true', help='inverse output data', default=False)
-parser.add_argument('--agg_patch', type=int, default=12, help='global patch length')
-parser.add_argument('--global_patch', type=int, default=24, help='global patch length')
-parser.add_argument('--local_patch', type=int, default=12, help='local patch length')
+parser.add_argument('--agg_patch', type=int, default=48, help='global patch length')
+parser.add_argument('--global_patch', type=int, default=48, help='global patch length')
+parser.add_argument('--local_patch', type=int, default=3, help='local patch length')
 
 # model define
 parser.add_argument('--top_k', type=int, default=5, help='for TimesBlock')
 parser.add_argument('--top_k_season', type=int, default=5, help='for ThreePartDFTDecomp')
 parser.add_argument('--top_k_trend', type=int, default=3, help='for ThreePartDFTDecomp')
-parser.add_argument('--agg_top_k', type=int, default=4, help='for ThreePartDFTDecomp')
+parser.add_argument('--agg_top_k', type=int, default=12, help='for ThreePartDFTDecomp')
 parser.add_argument('--num_kernels', type=int, default=6, help='for Inception')
 parser.add_argument('--enc_in', type=int, default=7, help='encoder input size')
 parser.add_argument('--dec_in', type=int, default=7, help='decoder input size')
@@ -73,8 +73,8 @@ parser.add_argument('--activation', type=str, default='gelu', help='activation')
 parser.add_argument('--output_attention', action='store_true', help='whether to output attention in ecoder')
 parser.add_argument('--channel_independence', type=int, default=1,
                     help='0: channel dependence 1: channel independence for FreTS model')#对单变量进行嵌入
-parser.add_argument('--decomp_method', type=str, default='three_part_dft_decomp',
-                    help='oving_avg ,dft_decomp or three_part_dft_decomp')
+parser.add_argument('--decomp_method', type=str, default='amplitude_threshold_hybrid_decomp',
+                    help='moving_avg ,dft_decomp ,three_part_dft_decomp or amplitude_threshold_hybrid_decomp')
 parser.add_argument('--use_norm', type=int, default=1, help='whether to use normalize; True 1 False 0')#0会跳过归一化
 parser.add_argument('--down_sampling_layers', type=int, default=3, help='num of down sampling layers')#3
 parser.add_argument('--down_sampling_window', type=int, default=2, help='down sampling window size')
@@ -87,7 +87,7 @@ parser.add_argument('--use_future_temporal_feature', type=int, default=0,
 parser.add_argument('--num_workers', type=int, default=10, help='data loader num workers')
 parser.add_argument('--itr', type=int, default=1, help='experiments times')
 parser.add_argument('--train_epochs', type=int, default=10, help='train epochs')
-parser.add_argument('--batch_size', type=int, default=128, help='batch size of train input data')#128
+parser.add_argument('--batch_size', type=int, default=256, help='batch size of train input data')#128
 parser.add_argument('--patience', type=int, default=10, help='early stopping patience')#trafic=10
 parser.add_argument('--learning_rate', type=float, default=0.01, help='optimizer learning rate')
 parser.add_argument('--des', type=str, default='test', help='exp description')
@@ -115,7 +115,7 @@ if args.use_gpu and args.use_multi_gpu:
     args.devices = args.devices.replace(' ', '')
     device_ids = args.devices.split(',')
     #args.device_ids = [int(id_) for id_ in device_ids]
-    args.device_ids = [int(device_ids[i]) for i in range(1,2)]
+    args.device_ids = [int(device_ids[i]) for i in range(2, 3)]
     args.gpu = args.device_ids[0]
 
 print('Args in experiment:')

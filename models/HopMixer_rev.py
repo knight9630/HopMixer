@@ -33,96 +33,6 @@ import numpy as np
 #         print(f"x_trend: {x_trend[0][0]}")
 #         return x_season, x_trend
 
-class moving_avg(nn.Module):
-    """
-    Moving average block to highlight the trend of time series
-    """
-    def __init__(self, kernel_size, stride):
-        super(moving_avg, self).__init__()
-        self.kernel_size = kernel_size
-        self.avg = nn.AvgPool1d(kernel_size=kernel_size, stride=stride, padding=0)
-
-    def forward(self, x):
-        # padding on the both ends of time series
-        front = x[:, 0:1, :].repeat(1, (self.kernel_size - 1) // 2, 1)
-        end = x[:, -1:, :].repeat(1, (self.kernel_size - 1) // 2, 1)
-        x = torch.cat([front, x, end], dim=1)
-        x = self.avg(x.permute(0, 2, 1))
-        x = x.permute(0, 2, 1)
-        return x
-
-class AmplitudeThresholdHybridDecomp(nn.Module):
-    """
-    Hybrid Decomposition based on Amplitude Threshold:
-    1. Trend: Moving Average
-    2. Season: FFT components with Amplitude >= ratio * Max_Amplitude
-    3. Noise: FFT components with Amplitude < ratio * Max_Amplitude
-    """
-    def __init__(self, kernel_size, threshold_ratio=0.2):
-        super(AmplitudeThresholdHybridDecomp, self).__init__()
-        # 1. 趋势提取器 (时域)
-        self.moving_avg = moving_avg(kernel_size, stride=1)
-        # 2. 阈值比例 (例如 0.2 表示 20%)
-        self.threshold_ratio = threshold_ratio
-
-    def forward(self, x):
-        """
-        x: [Batch, Length, Channel]
-        """
-        # --- Step 1: 提取 Trend (时域滑动平均) ---
-        x_trend = self.moving_avg(x)
-        
-        # --- Step 2: 获取残差 (Residue) ---
-        # x_res 包含了 Season + Noise
-        x_res = x - x_trend
-        
-        # --- Step 3: FFT 变换 ---
-        # 调整维度 [B, L, C] -> [B, C, L]
-        x_res_t = x_res.permute(0, 2, 1)
-        B, C, L = x_res_t.shape
-        
-        # rfft: [B, C, L//2+1]
-        xf = torch.fft.rfft(x_res_t, dim=-1) 
-        freq_amp = torch.abs(xf) # 获取幅值
-        
-        # --- Step 4: 动态阈值分离 Season 和 Noise ---
-        
-        # 4.1 去除直流分量 (0频率) 的干扰
-        # 直流分量代表局部均值，已经在 Trend 里被处理了，
-        # 我们不希望它作为 "最大幅值" 的基准，所以暂时把它设为 0
-        freq_amp_no_dc = freq_amp.clone()
-        freq_amp_no_dc[..., 0] = 0 
-        
-        # 4.2 计算最大幅值
-        # [B, C, 1]
-        max_amp, _ = torch.max(freq_amp_no_dc, dim=-1, keepdim=True)
-        
-        # 4.3 计算阈值 (Threshold)
-        # 阈值 = max_amp * 0.2
-        threshold = max_amp * self.threshold_ratio
-        
-        # 4.4 生成掩码 (Mask)
-        # Noise Mask: 幅值 < 阈值 的部分
-        # 注意：这里我们保留直流分量给 Noise 或者 Season 都可以，
-        # 但通常直流分量能量很小(因为减去了Trend)，给 Noise 比较合理
-        noise_mask = freq_amp < threshold
-        
-        # --- Step 5: 逆变换重构 ---
-        
-        # 构建 Noise 的频域信号
-        xf_noise = torch.zeros_like(xf)
-        xf_noise[noise_mask] = xf[noise_mask]
-        
-        # 反变换得到时域 Noise
-        x_noise = torch.fft.irfft(xf_noise, n=L, dim=-1)
-        x_noise = x_noise.permute(0, 2, 1) # [B, L, C]
-        
-        # 计算 Season = 残差 - Noise
-        # 这样保证 Season + Noise + Trend = Original，没有任何信息丢失
-        x_season = x_res - x_noise
-        
-        return x_season, x_trend, x_noise
-    
 class DFT_series_decomp(nn.Module):
     """
     Series decomposition block using DFT (修复版)
@@ -228,8 +138,7 @@ class ThreePartDFTDecomp(nn.Module):
         
         # 还原维度 (B, L, C)
         return x_season.permute(0, 2, 1), x_trend.permute(0, 2, 1), x_noise.permute(0, 2, 1)
-
-        
+    
 class MultiScaleSeasonMixing(nn.Module):
     """
     Bottom-up mixing season pattern
@@ -343,8 +252,6 @@ class PastDecomposableMixing(nn.Module):
             self.decompsition = DFT_series_decomp(configs.top_k)
         elif configs.decomp_method == "three_part_dft_decomp":
             self.decompsition = ThreePartDFTDecomp(configs.top_k_season, configs.top_k_trend)
-        elif configs.decomp_method == "amplitude_threshold_hybrid_decomp":
-            self.decompsition = AmplitudeThresholdHybridDecomp(kernel_size=configs.moving_avg, threshold_ratio=0.2)
         else:
             raise ValueError('decompsition is error')
 
@@ -369,7 +276,7 @@ class PastDecomposableMixing(nn.Module):
                 [
                     # SeasonRectifiedAugmenter_CI_TopK(configs.agg_patch, configs.agg_patch, configs.agg_top_k)
                     # for _ in range(configs.down_sampling_layers + 1)
-                    SeasonRectifiedAugmenter_CI(configs.agg_patch, configs.agg_patch)
+                    SeasonRectifiedAugmenter_CD(configs.agg_patch, configs.agg_patch)
                     for _ in range(configs.down_sampling_layers + 1)
                 ]
             )
@@ -545,7 +452,6 @@ class PastDecomposableMixing(nn.Module):
             length_list.append(T)
 
         # Decompose to obtain the season and trend
-        ori_season_list = []
         out_season_list = []
         out_trend_list = []
         out_season_noise_list = []
@@ -553,7 +459,6 @@ class PastDecomposableMixing(nn.Module):
         for x in x_list:
             # print(f'xshape{x.shape}')
             season, trend, noise = self.decompsition(x)
-            ori_season_list.append(season)
             # print(f'seasonshape{season.shape}')
             # self.plot_first_sample_curves(x.permute(0, 2, 1), trend.permute(0, 2, 1), season.permute(0, 2, 1), index, save_dir="batch_plots_DFT_3")
             trend=self.Trend_MLP[index](trend)
@@ -572,11 +477,9 @@ class PastDecomposableMixing(nn.Module):
 
         out_list = []
         layer_num = 0
-        for ori, out_season, out_trend, out_season_noise, season, length in zip(x_list, out_season_list, out_trend_list,out_season_noise_list,ori_season_list,
+        for ori, out_season, out_trend, out_season_noise, length in zip(x_list, out_season_list, out_trend_list,out_season_noise_list,
                                                       length_list):
             out = out_season + out_trend + self.alpha[layer_num] * out_season_noise
-
-            # out = out_season + out_trend + self.alpha[layer_num] * (out_season_noise-season)
 
             # w = torch.softmax(self.fusion_weights[layer_num], dim=0)
             # out = w[0] * out_trend + w[1] * out_season + w[2] * out_season_noise
